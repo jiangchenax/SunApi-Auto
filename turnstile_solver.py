@@ -155,6 +155,49 @@ LOGIN_JS = '''async (args) => {
     catch (e) { return {success: false, message: '响应非JSON: ' + text.substring(0, 120)}; }
 }'''
 
+FETCH_SITEKEY_JS = '''async () => {
+    try {
+        const r = await fetch('/api/status');
+        const j = await r.json();
+        return (j.data && j.data.turnstile_site_key) || null;
+    } catch (e) { return null; }
+}'''
+
+SOLVE_POW_JS = '''async (headers) => {
+    const r = await fetch('/api/user/pow/challenge?action=checkin', {
+        credentials: 'include', headers: headers
+    });
+    const j = await r.json();
+    if (!j.success) throw new Error(j.message || '获取 PoW 挑战失败');
+    const {challenge_id, prefix, difficulty} = j.data;
+    let n = 0;
+    for (;;) {
+        const nonce = n.toString(16).padStart(8, '0');
+        const h = new Uint8Array(await crypto.subtle.digest('SHA-256',
+            new TextEncoder().encode(prefix + nonce)));
+        const full = Math.floor(difficulty / 8), rem = difficulty % 8;
+        let ok = true;
+        for (let i = 0; i < full; i++) if (h[i] !== 0) { ok = false; break; }
+        if (ok && rem > 0 && (h[full] & (255 << (8 - rem))) !== 0) ok = false;
+        if (ok) return {challenge_id, nonce};
+        n++;
+        if (n > 0xffffffff) throw new Error('超过最大尝试次数');
+    }
+}'''
+
+POST_JS = '''async (args) => {
+    const headers = Object.assign({'Content-Type': 'application/json'}, args.headers);
+    const resp = await fetch('/api/user/checkin' + (args.query || ''), {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(args.body || {}),
+        credentials: 'include',
+    });
+    const text = await resp.text();
+    try { return JSON.parse(text); }
+    catch (e) { return { success: false, message: '响应非JSON: ' + text.substring(0, 120) }; }
+}'''
+
 
 def find_chrome():
     for path in CHROME_CANDIDATES:
@@ -351,16 +394,103 @@ def _wait_cf_pass(page, base_url, timeout=60, verbose=True):
     return False
 
 
-def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = None,
-                      proxy: str = None, max_wait: int = 120, verbose: bool = True):
+def _connect_cdp(p, dbg_port):
+    """连接已启动的 Chrome，重试 3 次"""
+    browser = None
+    last_err = None
+    for _ in range(3):
+        try:
+            browser = p.chromium.connect_over_cdp(f'http://127.0.0.1:{dbg_port}')
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(3)
+    if browser is None:
+        raise RuntimeError(f'CDP 连接失败: {last_err}')
+    return browser
+
+
+def _fetch_sitekey(page, verbose=True):
+    """从 /api/status 读取 Turnstile sitekey"""
+    sitekey = page.evaluate(FETCH_SITEKEY_JS)
+    if verbose:
+        print(f'[Turnstile] sitekey: {sitekey}')
+    return sitekey
+
+
+def _checkin_in_page(page, auth_headers, sitekey=None, max_wait=120,
+                     verbose=True, pre_solve=False):
     """
-    在站点页面内完成 Turnstile 解验证 + 签到全流程（requests 被 CF 拦也能走通）
+    在已打开的页面内完成签到。
+
+    Args:
+        pre_solve: True 时先解一次 Turnstile 再提交，避免先发一个必然被拦的裸请求
+    Returns:
+        签到接口 JSON dict
+    """
+    from urllib.parse import quote
+    auth_headers = auth_headers or {}
+    ts_token = None
+    pow_params = None
+
+    if pre_solve:
+        if not sitekey:
+            sitekey = _fetch_sitekey(page, verbose)
+        if not sitekey:
+            return {'success': False, 'message': '站点未提供 Turnstile sitekey'}
+        ts_token = _solve_in_page(page, sitekey, max_wait=max_wait, verbose=verbose)
+        if not ts_token:
+            return {'success': False, 'message': 'Turnstile 解验证失败'}
+
+    def submit():
+        query = ''
+        body = {}
+        if ts_token:
+            query += ('&' if query else '?') + 'turnstile=' + quote(ts_token)
+            body['turnstile'] = ts_token
+        if pow_params:
+            query += ('&' if query else '?') + ('pow_challenge=' + quote(pow_params['challenge_id']) +
+                                                '&pow_nonce=' + quote(pow_params['nonce']))
+        return page.evaluate(POST_JS, {'headers': auth_headers, 'query': query, 'body': body})
+
+    result = submit()
+    # 服务端追加 PoW / Turnstile 要求时补验证，最多两轮
+    for _ in range(2):
+        if not isinstance(result, dict) or result.get('success'):
+            break
+        msg = str(result.get('message', '')).lower()
+        if 'pow' in msg and pow_params is None:
+            if verbose:
+                print('[Turnstile] 服务端要求 PoW 工作量证明，页面内解算...')
+            pow_params = page.evaluate(SOLVE_POW_JS, auth_headers)
+            if verbose:
+                print(f"[Turnstile] PoW 解算完成: nonce={pow_params['nonce']}")
+        elif 'turnstile' in msg:
+            if not sitekey:
+                sitekey = _fetch_sitekey(page, verbose)
+            if not sitekey:
+                break
+            ts_token = _solve_in_page(page, sitekey, max_wait=max_wait, verbose=verbose)
+            if not ts_token:
+                break
+        else:
+            break
+        result = submit()
+    return result
+
+
+def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = None,
+                      proxy: str = None, max_wait: int = 120, verbose: bool = True,
+                      pre_solve: bool = False):
+    """
+    在站点页面内完成签到（requests 被 CF 拦也能走通）
 
     Args:
         base_url: 站点地址
         sitekey: Turnstile sitekey，不传则自动从 /api/status 获取
         auth_headers: 签到请求头（Authorization / New-Api-User）
         proxy: 代理地址；默认自动读系统代理（GHA 无代理则为 None）
+        pre_solve: 先解 Turnstile 再提交，避免空请求
     Returns:
         签到接口的 JSON 响应 dict，失败返回 None
     """
@@ -372,17 +502,7 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            browser = None
-            last_err = None
-            for _ in range(3):
-                try:
-                    browser = p.chromium.connect_over_cdp(f'http://127.0.0.1:{dbg_port}')
-                    break
-                except Exception as e:
-                    last_err = e
-                    time.sleep(3)
-            if browser is None:
-                raise RuntimeError(f'CDP 连接失败: {last_err}')
+            browser = _connect_cdp(p, dbg_port)
             ctx = browser.contexts[0]
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
@@ -391,92 +511,87 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
                     print('[Turnstile] CF 验证未通过')
                 return None
 
-            # 页面内 JS：PoW 挑战获取 + 求解（SHA-256 前导零比特，与官方 Worker 算法一致）
-            SOLVE_POW_JS = '''async (headers) => {
-                const r = await fetch('/api/user/pow/challenge?action=checkin', {
-                    credentials: 'include', headers: headers
-                });
-                const j = await r.json();
-                if (!j.success) throw new Error(j.message || '获取 PoW 挑战失败');
-                const {challenge_id, prefix, difficulty} = j.data;
-                let n = 0;
-                for (;;) {
-                    const nonce = n.toString(16).padStart(8, '0');
-                    const h = new Uint8Array(await crypto.subtle.digest('SHA-256',
-                        new TextEncoder().encode(prefix + nonce)));
-                    const full = Math.floor(difficulty / 8), rem = difficulty % 8;
-                    let ok = true;
-                    for (let i = 0; i < full; i++) if (h[i] !== 0) { ok = false; break; }
-                    if (ok && rem > 0 && (h[full] & (255 << (8 - rem))) !== 0) ok = false;
-                    if (ok) return {challenge_id, nonce};
-                    n++;
-                    if (n > 0xffffffff) throw new Error('超过最大尝试次数');
-                }
-            }'''
-
-            POST_JS = '''async (args) => {
-                const headers = Object.assign({'Content-Type': 'application/json'}, args.headers);
-                const resp = await fetch('/api/user/checkin' + (args.query || ''), {
-                    method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify(args.body || {}),
-                    credentials: 'include',
-                });
-                const text = await resp.text();
-                try { return JSON.parse(text); }
-                catch (e) { return { success: false, message: '响应非JSON: ' + text.substring(0, 120) }; }
-            }'''
-
-            # 第一跳：不带验证参数直接签到
-            result = page.evaluate(POST_JS, {'headers': auth_headers})
-
-            # 按服务端要求补验证（最多两轮：PoW / Turnstile 任意组合）
-            ts_token = None
-            pow_params = None
-            for _ in range(2):
-                if not isinstance(result, dict) or result.get('success'):
-                    break
-                msg = str(result.get('message', '')).lower()
-                if 'pow' in msg and pow_params is None:
-                    if verbose:
-                        print('[Turnstile] 服务端要求 PoW 工作量证明，页面内解算...')
-                    pow_params = page.evaluate(SOLVE_POW_JS, auth_headers)
-                    if verbose:
-                        print(f"[Turnstile] PoW 解算完成: nonce={pow_params['nonce']}")
-                elif 'turnstile' in msg and ts_token is None:
-                    if not sitekey:
-                        sitekey = page.evaluate('''async () => {
-                            try {
-                                const r = await fetch('/api/status');
-                                const j = await r.json();
-                                return (j.data && j.data.turnstile_site_key) || null;
-                            } catch (e) { return null; }
-                        }''')
-                        if verbose:
-                            print(f'[Turnstile] sitekey: {sitekey}')
-                    if not sitekey:
-                        break
-                    ts_token = _solve_in_page(page, sitekey, max_wait=max_wait, verbose=verbose)
-                    if not ts_token:
-                        break
-                else:
-                    break
-                # 组装查询参数并重试
-                query = ''
-                body = {}
-                from urllib.parse import quote
-                if ts_token:
-                    query += ('&' if query else '?') + 'turnstile=' + quote(ts_token)
-                    body['turnstile'] = ts_token
-                if pow_params:
-                    query += ('&' if query else '?') + ('pow_challenge=' + quote(pow_params['challenge_id']) +
-                             '&pow_nonce=' + quote(pow_params['nonce']))
-                result = page.evaluate(POST_JS, {'headers': auth_headers, 'query': query, 'body': body})
-
+            result = _checkin_in_page(page, auth_headers, sitekey, max_wait, verbose, pre_solve)
             browser.close()
             return result
     except Exception as e:
         print(f'[Turnstile] 求解失败: {e}')
+        return None
+    finally:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def login_and_checkin(base_url: str, username: str, password: str, sitekey: str = None,
+                      proxy: str = None, max_wait: int = 120, verbose: bool = True):
+    """
+    单次浏览器会话完成「登录 + 签到」。
+
+    登录与签到各需要一个新的 Turnstile token（token 一次性，不能复用），
+    但共用同一个页面上下文，只启动一次 Chrome；签到前先解验证，不再空跑一次请求。
+
+    Returns:
+        {'checkin': dict, 'access_token': str, 'user_id': str} 或 None
+    """
+    if proxy is None:
+        proxy = _get_system_proxy()
+
+    proc, dbg_port = _launch_chrome(proxy, url=base_url)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = _connect_cdp(p, dbg_port)
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            if not _wait_cf_pass(page, base_url, verbose=verbose):
+                if verbose:
+                    print('[登录] CF 验证未通过')
+                return None
+
+            if not sitekey:
+                sitekey = _fetch_sitekey(page, verbose)
+            if not sitekey:
+                if verbose:
+                    print('[登录] 无法获取 Turnstile sitekey')
+                return None
+
+            ts_token = _solve_in_page(page, sitekey, max_wait=max_wait, verbose=verbose)
+            if not ts_token:
+                if verbose:
+                    print('[登录] Turnstile 解验证失败')
+                return None
+
+            login_result = page.evaluate(LOGIN_JS, {
+                'username': username, 'password': password, 'turnstile': ts_token,
+            })
+            data = (login_result or {}).get('data') or {}
+            token = data.get('access_token')
+            if not token:
+                if verbose:
+                    print(f"[登录] 登录失败: {str((login_result or {}).get('message', '未知错误'))}")
+                return None
+
+            token_type = data.get('token_type') or 'Bearer'
+            auth_headers = {'Authorization': f'{token_type} {token}'}
+            user = data.get('user') or {}
+            if user.get('id'):
+                auth_headers['New-Api-User'] = str(user['id'])
+            if verbose:
+                print('[登录] 登录成功，已获取访问令牌')
+
+            result = _checkin_in_page(page, auth_headers, sitekey, max_wait, verbose, pre_solve=True)
+            browser.close()
+            return {
+                'checkin': result,
+                'access_token': auth_headers['Authorization'],
+                'user_id': auth_headers.get('New-Api-User'),
+                'user': user,
+            }
+    except Exception as e:
+        print(f'[登录] 登录/签到异常: {e}')
         return None
     finally:
         try:

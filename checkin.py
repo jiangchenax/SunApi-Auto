@@ -185,11 +185,32 @@ class NewAPICheckin:
         执行签到
 
         流程：
-        1. requests 直连签到（快速模式）
-        2. 返回 Turnstile 要求时真实浏览器解验证后重签
-        3. 返回 PoW 要求时本地解算后重签
+        1. 无令牌时：一次浏览器会话完成登录 + 签到（各解一次 Turnstile）
+        2. 有令牌时：requests 直连签到
+        3. 返回 Turnstile / PoW 要求时走对应兜底流程
         """
         result = {'success': False, 'message': '', 'checkin_date': None, 'quota_awarded': None}
+
+        # 没有令牌时，用一个浏览器会话直接完成「登录 + 签到」，
+        # 不再先发一个注定 401 的请求、再发一个注定被 Turnstile 拦的签到请求
+        if not self.access_token and self.login_username and self.login_password:
+            try:
+                from turnstile_solver import login_and_checkin
+            except ImportError:
+                result['message'] = '缺少依赖 (playwright + Chrome)，无法登录'
+                return result
+            print('  [登录] 浏览器内一次完成登录 + 签到（自动解 Turnstile）...')
+            data = login_and_checkin(self.base_url, self.login_username, self.login_password)
+            if not data:
+                result['message'] = '登录/签到流程失败'
+                return result
+            self.access_token = data.get('access_token')
+            self.user_id = data.get('user_id')
+            if self.access_token:
+                self.session.headers['Authorization'] = self.access_token
+            if self.user_id:
+                self.session.headers['new-api-user'] = str(self.user_id)
+            return self._apply_checkin_data(data.get('checkin'), result)
 
         try:
             resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
@@ -216,30 +237,7 @@ class NewAPICheckin:
                 result['message'] = f'响应格式错误 (HTTP {resp.status_code}): {content_preview}'
                 return result
 
-            if resp.status_code == 200 and data.get('success'):
-                result['success'] = True
-                result['message'] = data.get('message', '签到成功')
-                checkin_data = data.get('data', {})
-                if isinstance(checkin_data, dict):
-                    result['checkin_date'] = checkin_data.get('checkin_date')
-                    result['quota_awarded'] = checkin_data.get('quota_awarded')
-                return result
-
-            message = str(data.get('message') or '签到失败')
-            already_keywords = ['已签到', '已经签到', 'already', '重复签到']
-            if any(k in message.lower() for k in already_keywords):
-                result['success'] = True
-                result['message'] = message
-            elif 'turnstile' in message.lower():
-                # 站点开启 Turnstile 人机验证，走真实浏览器解验证后重签
-                print(f'[Turnstile] 站点要求人机验证: {message}')
-                return self._turnstile_checkin(result)
-            elif 'pow' in message.lower():
-                # 站点开启 PoW 工作量证明，本地直接解算后重签
-                print(f'[PoW] 站点要求工作量证明: {message}')
-                return self._checkin_with_pow(result)
-            else:
-                result['message'] = message
+            return self._apply_checkin_data(data, result)
 
         except requests.exceptions.Timeout:
             result['message'] = '请求超时'
@@ -248,6 +246,35 @@ class NewAPICheckin:
         except Exception as e:
             result['message'] = f'未知错误: {self._redact(e)}'
 
+        return result
+
+    def _apply_checkin_data(self, data, result: dict) -> dict:
+        """解析签到接口响应：成功 / 已签到 / Turnstile / PoW"""
+        if not isinstance(data, dict):
+            result['message'] = '签到接口无有效响应'
+            return result
+        if data.get('success'):
+            result['success'] = True
+            result['message'] = data.get('message', '签到成功')
+            checkin_data = data.get('data', {})
+            if isinstance(checkin_data, dict):
+                result['checkin_date'] = checkin_data.get('checkin_date')
+                result['quota_awarded'] = checkin_data.get('quota_awarded')
+            return result
+
+        message = str(data.get('message') or '签到失败')
+        already_keywords = ['已签到', '已经签到', 'already', '重复签到']
+        if any(k in message.lower() for k in already_keywords):
+            result['success'] = True
+            result['message'] = message
+        elif 'turnstile' in message.lower():
+            print(f'[Turnstile] 站点要求人机验证: {message}')
+            return self._turnstile_checkin(result)
+        elif 'pow' in message.lower():
+            print(f'[PoW] 站点要求工作量证明: {message}')
+            return self._checkin_with_pow(result)
+        else:
+            result['message'] = message
         return result
 
     @staticmethod
@@ -533,18 +560,13 @@ def main():
 
         client = NewAPICheckin(url, login_username, login_password)
 
-        # 获取用户信息（未登录时自动浏览器登录）
-        user_info = client.get_user_info()
+        # 直接签到：无令牌时内部用一次浏览器会话完成登录 + 签到
+        result = client.checkin()
+
+        # 签到后令牌已就绪，再用 requests 取用户信息，不再启动浏览器
+        user_info = client.get_user_info() if client.access_token else None
         if user_info:
             print(f'  用户: {_mask_account(user_info.get("username", "未知"))}')
-        elif not client.access_token:
-            # 完全未登录，继续签到只会再启动一次浏览器重试，直接跳过
-            fail_count += 1
-            print('  结果: ❌ 登录失败（账号密码错误或站点不可达），跳过签到')
-            print()
-            continue
-        else:
-            print('  用户: 获取失败，继续尝试签到')
 
         # 执行签到
         result = client.checkin()
