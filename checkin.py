@@ -57,6 +57,10 @@ class NewAPICheckin:
 
     # ---------- 登录 ----------
 
+    def _redact(self, text) -> str:
+        """脱敏本账号相关的 URL / 用户名（日志输出用）"""
+        return _redact(text, self.base_url, self.login_username)
+
     def _browser_login(self, force: bool = False) -> bool:
         """
         账号密码登录：真实 Chrome 解 Turnstile 后在页面内提交登录，获取 Bearer JWT。
@@ -165,10 +169,10 @@ class NewAPICheckin:
             print('[错误] 请求超时')
             return None
         except requests.exceptions.RequestException as e:
-            print(f'[错误] 网络请求失败: {e}')
+            print(f'[错误] 网络请求失败: {self._redact(e)}')
             return None
         except Exception as e:
-            print(f'[错误] 未知错误: {e}')
+            print(f'[错误] 未知错误: {self._redact(e)}')
             if verbose:
                 import traceback
                 traceback.print_exc()
@@ -240,9 +244,9 @@ class NewAPICheckin:
         except requests.exceptions.Timeout:
             result['message'] = '请求超时'
         except requests.exceptions.RequestException as e:
-            result['message'] = f'网络请求失败: {e}'
+            result['message'] = f'网络请求失败: {self._redact(e)}'
         except Exception as e:
-            result['message'] = f'未知错误: {e}'
+            result['message'] = f'未知错误: {self._redact(e)}'
 
         return result
 
@@ -271,7 +275,7 @@ class NewAPICheckin:
                                  params={'action': 'checkin'}, timeout=30)
             data = r.json()
             if not data.get('success'):
-                result['message'] = f"获取 PoW 挑战失败: {data.get('message', '未知错误')}"
+                result['message'] = f"获取 PoW 挑战失败: {self._redact(data.get('message', '未知错误'))}"
                 return result
             ch = data['data']
             difficulty = int(ch['difficulty'])
@@ -298,9 +302,9 @@ class NewAPICheckin:
                 print('[Turnstile] PoW 后仍需人机验证，转 Turnstile 流程...')
                 return self._turnstile_checkin(result, _depth + 1)
             else:
-                result['message'] = f'PoW 签到失败: {message}'
+                result['message'] = f'PoW 签到失败: {self._redact(message)}'
         except Exception as e:
-            result['message'] = f'PoW 签到异常: {e}'
+            result['message'] = f'PoW 签到异常: {self._redact(e)}'
         return result
 
     def _turnstile_checkin(self, result: dict, _depth: int = 0) -> dict:
@@ -347,7 +351,7 @@ class NewAPICheckin:
             print('[PoW] Turnstile 后仍需工作量证明，转 PoW 流程...')
             return self._checkin_with_pow(result, _depth + 1)
         else:
-            result['message'] = f'Turnstile 验证后签到失败: {message}'
+            result['message'] = f'Turnstile 验证后签到失败: {self._redact(message)}'
 
         return result
 
@@ -459,6 +463,27 @@ def _mask_account(text) -> str:
     return text[:3] + '***'
 
 
+def _redact(text, *values) -> str:
+    """把文本中的账号、URL 替换为脱敏形式（服务端消息 / 异常信息用）"""
+    text = str(text)
+    for value in values:
+        value = str(value or '')
+        if value.startswith(('http://', 'https://')):
+            masked_url = _mask_url(value)
+            text = text.replace(value.rstrip('/'), masked_url.rstrip('/'))
+            # 异常信息里通常只出现 host，单独替换一次
+            try:
+                from urllib.parse import urlparse
+                raw_host = urlparse(value).hostname
+                if raw_host:
+                    text = text.replace(raw_host, masked_url.split('://', 1)[-1])
+            except Exception:
+                pass
+        elif len(value) >= 3:
+            text = text.replace(value, _mask_account(value))
+    return text
+
+
 def _format_quota(quota) -> str:
     """格式化额度显示"""
     if not quota:
@@ -526,7 +551,7 @@ def main():
 
         if result['success']:
             success_count += 1
-            print(f'  结果: ✅ {result["message"]}')
+            print(f'  结果: ✅ {_redact(result["message"], login_username, url)}')
             if result['checkin_date']:
                 print(f'  日期: {result["checkin_date"]}')
             quota_str = _format_quota(result['quota_awarded'])
@@ -542,7 +567,7 @@ def main():
                 print(f'  统计: 本月已签 {checkin_count} 天，累计 {total_str} 额度')
         else:
             fail_count += 1
-            print(f'  结果: ❌ {result["message"]}')
+            print(f'  结果: ❌ {_redact(result["message"], login_username, url)}')
 
         print()
 
