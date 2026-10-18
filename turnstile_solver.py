@@ -524,47 +524,6 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
             pass
 
 
-def login_and_checkin(base_url: str, username: str, password: str, sitekey: str = None,
-                      proxy: str = None, max_wait: int = 120, verbose: bool = True):
-    """
-    登录 + 签到（一次调用完成）。
-
-    登录与签到各自需要一个新的 Turnstile token。实测同一 Chrome 进程内
-    连续解两次时，第二个 token 会被服务端判为无效，因此两步各用独立进程。
-
-    Returns:
-        {'checkin': dict, 'access_token': str, 'user_id': str} 或 None
-    """
-    data = login_and_get_token(base_url, username, password, sitekey,
-                               proxy, max_wait, verbose)
-    if not data:
-        return None
-
-    token = data.get('access_token')
-    if not token:
-        return None
-
-    token_type = data.get('token_type') or 'Bearer'
-    auth_headers = {'Authorization': f'{token_type} {token}'}
-    user = data.get('user') or {}
-    if user.get('id'):
-        auth_headers['New-Api-User'] = str(user['id'])
-
-    # 两次 Turnstile 之间需要短暂间隔，否则第二个 token 会被判无效
-    time.sleep(8)
-
-    # NewAPI 需要先收到一次签到请求才会建立 Turnstile 校验上下文，
-    # 预生成的 token 会被判空，因此这里保留一次探测请求
-    result = solve_and_checkin(base_url, sitekey, auth_headers, proxy,
-                               max_wait, verbose, pre_solve=False)
-    return {
-        'checkin': result,
-        'access_token': auth_headers['Authorization'],
-        'user_id': auth_headers.get('New-Api-User'),
-        'user': user,
-    }
-
-
 def get_turnstile_token(sitekey: str, proxy: str = None, max_wait: int = 90, verbose: bool = True):
     """本地页面渲染 Turnstile 组件并自动点击，返回 token（调试用）"""
     if proxy is None:

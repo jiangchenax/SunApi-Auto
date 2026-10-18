@@ -185,32 +185,18 @@ class NewAPICheckin:
         执行签到
 
         流程：
-        1. 无令牌时：一次浏览器会话完成登录 + 签到（各解一次 Turnstile）
-        2. 有令牌时：requests 直连签到
-        3. 返回 Turnstile / PoW 要求时走对应兜底流程
+        1. 无令牌时先浏览器登录（解 Turnstile）
+        2. requests 直连签到；服务端要求验证时再走浏览器 / PoW 兜底
         """
         result = {'success': False, 'message': '', 'checkin_date': None, 'quota_awarded': None}
 
-        # 没有令牌时，用一个浏览器会话直接完成「登录 + 签到」，
-        # 不再先发一个注定 401 的请求、再发一个注定被 Turnstile 拦的签到请求
+        # 没有令牌时先在浏览器里登录（登录本身需要 Turnstile），
+        # 不再先发一个注定 401 的请求；登录后继续走下面的签到流程
         if not self.access_token and self.login_username and self.login_password:
-            try:
-                from turnstile_solver import login_and_checkin
-            except ImportError:
-                result['message'] = '缺少依赖 (playwright + Chrome)，无法登录'
+            print('  [登录] 先在浏览器中登录（自动解 Turnstile）...')
+            if not self._browser_login(force=True):
+                result['message'] = '登录失败（账号密码错误或站点不可达）'
                 return result
-            print('  [登录] 浏览器内一次完成登录 + 签到（自动解 Turnstile）...')
-            data = login_and_checkin(self.base_url, self.login_username, self.login_password)
-            if not data:
-                result['message'] = '登录/签到流程失败'
-                return result
-            self.access_token = data.get('access_token')
-            self.user_id = data.get('user_id')
-            if self.access_token:
-                self.session.headers['Authorization'] = self.access_token
-            if self.user_id:
-                self.session.headers['new-api-user'] = str(self.user_id)
-            return self._apply_checkin_data(data.get('checkin'), result)
 
         try:
             resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
