@@ -550,9 +550,10 @@ def login_and_checkin(base_url: str, username: str, password: str, sitekey: str 
     if user.get('id'):
         auth_headers['New-Api-User'] = str(user['id'])
 
-    # 新进程内先解 Turnstile 再签到，避免空跑一次注定被拦的请求
+    # NewAPI 需要先收到一次签到请求才会建立 Turnstile 校验上下文，
+    # 预生成的 token 会被判空，因此这里保留一次探测请求
     result = solve_and_checkin(base_url, sitekey, auth_headers, proxy,
-                               max_wait, verbose, pre_solve=True)
+                               max_wait, verbose, pre_solve=False)
     return {
         'checkin': result,
         'access_token': auth_headers['Authorization'],
