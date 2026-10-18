@@ -527,89 +527,38 @@ def solve_and_checkin(base_url: str, sitekey: str = None, auth_headers: dict = N
 def login_and_checkin(base_url: str, username: str, password: str, sitekey: str = None,
                       proxy: str = None, max_wait: int = 120, verbose: bool = True):
     """
-    单次浏览器会话完成「登录 + 签到」。
+    登录 + 签到（一次调用完成）。
 
-    登录与签到各需要一个新的 Turnstile token（token 一次性，不能复用），
-    但共用同一个页面上下文，只启动一次 Chrome；签到前先解验证，不再空跑一次请求。
+    登录与签到各自需要一个新的 Turnstile token。实测同一 Chrome 进程内
+    连续解两次时，第二个 token 会被服务端判为无效，因此两步各用独立进程。
 
     Returns:
         {'checkin': dict, 'access_token': str, 'user_id': str} 或 None
     """
-    if proxy is None:
-        proxy = _get_system_proxy()
-
-    proc, dbg_port = _launch_chrome(proxy, url=base_url)
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = _connect_cdp(p, dbg_port)
-            ctx = browser.contexts[0]
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-
-            if not _wait_cf_pass(page, base_url, verbose=verbose):
-                if verbose:
-                    print('[登录] CF 验证未通过')
-                return None
-
-            if not sitekey:
-                sitekey = _fetch_sitekey(page, verbose)
-            if not sitekey:
-                if verbose:
-                    print('[登录] 无法获取 Turnstile sitekey')
-                return None
-
-            ts_token = _solve_in_page(page, sitekey, max_wait=max_wait, verbose=verbose)
-            if not ts_token:
-                if verbose:
-                    print('[登录] Turnstile 解验证失败')
-                return None
-
-            login_result = page.evaluate(LOGIN_JS, {
-                'username': username, 'password': password, 'turnstile': ts_token,
-            })
-            data = (login_result or {}).get('data') or {}
-            token = data.get('access_token')
-            if not token:
-                if verbose:
-                    print(f"[登录] 登录失败: {str((login_result or {}).get('message', '未知错误'))}")
-                return None
-
-            token_type = data.get('token_type') or 'Bearer'
-            auth_headers = {'Authorization': f'{token_type} {token}'}
-            user = data.get('user') or {}
-            if user.get('id'):
-                auth_headers['New-Api-User'] = str(user['id'])
-            if verbose:
-                print('[登录] 登录成功，已获取访问令牌')
-
-            # 同一浏览器会话连续解两次 Turnstile，第二个 token 会被判无效；
-            # 用独立上下文（共享同一 Chrome 进程，Cookie 隔离）做签到验证
-            try:
-                checkin_ctx = browser.new_context()
-            except Exception:
-                checkin_ctx = ctx
-            checkin_page = checkin_ctx.new_page()
-            if not _wait_cf_pass(checkin_page, base_url, verbose=verbose):
-                if verbose:
-                    print('[签到] CF 验证未通过')
-                return None
-
-            result = _checkin_in_page(checkin_page, auth_headers, sitekey, max_wait, verbose, pre_solve=True)
-            browser.close()
-            return {
-                'checkin': result,
-                'access_token': auth_headers['Authorization'],
-                'user_id': auth_headers.get('New-Api-User'),
-                'user': user,
-            }
-    except Exception as e:
-        print(f'[登录] 登录/签到异常: {e}')
+    data = login_and_get_token(base_url, username, password, sitekey,
+                               proxy, max_wait, verbose)
+    if not data:
         return None
-    finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+
+    token = data.get('access_token')
+    if not token:
+        return None
+
+    token_type = data.get('token_type') or 'Bearer'
+    auth_headers = {'Authorization': f'{token_type} {token}'}
+    user = data.get('user') or {}
+    if user.get('id'):
+        auth_headers['New-Api-User'] = str(user['id'])
+
+    # 新进程内先解 Turnstile 再签到，避免空跑一次注定被拦的请求
+    result = solve_and_checkin(base_url, sitekey, auth_headers, proxy,
+                               max_wait, verbose, pre_solve=True)
+    return {
+        'checkin': result,
+        'access_token': auth_headers['Authorization'],
+        'user_id': auth_headers.get('New-Api-User'),
+        'user': user,
+    }
 
 
 def get_turnstile_token(sitekey: str, proxy: str = None, max_wait: int = 90, verbose: bool = True):
