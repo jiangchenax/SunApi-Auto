@@ -582,9 +582,13 @@ def login_and_checkin(base_url: str, username: str, password: str, sitekey: str 
             if verbose:
                 print('[登录] 登录成功，已获取访问令牌')
 
-            # 同一页面连续解两次 Turnstile，第二个 token 会被判无效；
-            # 新开标签页（共享登录 Cookie）再做签到验证
-            checkin_page = ctx.new_page()
+            # 同一浏览器会话连续解两次 Turnstile，第二个 token 会被判无效；
+            # 用独立上下文（共享同一 Chrome 进程，Cookie 隔离）做签到验证
+            try:
+                checkin_ctx = browser.new_context()
+            except Exception:
+                checkin_ctx = ctx
+            checkin_page = checkin_ctx.new_page()
             if not _wait_cf_pass(checkin_page, base_url, verbose=verbose):
                 if verbose:
                     print('[签到] CF 验证未通过')
