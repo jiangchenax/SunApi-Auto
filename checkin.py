@@ -44,18 +44,28 @@ class NewAPICheckin:
 
     # ---------- 登录 ----------
 
-    def _browser_login(self) -> bool:
+    def _browser_login(self, force: bool = False) -> bool:
         """
         账号密码登录：真实 Chrome 解 Turnstile 后在页面内提交登录，获取 Bearer JWT。
 
         本站点登录强制 Turnstile，requests 无法直连，必须走浏览器。
+
+        Args:
+            force: 强制重新登录（令牌已失效时使用，忽略现有 access_token）
         """
         if not self.login_username or not self.login_password:
             return False
 
-        # 本次运行内已有访问令牌则无需重复登录
-        if self.access_token:
+        # 本次运行内已有访问令牌则无需重复登录（force=True 时跳过此判断）
+        if self.access_token and not force:
             return True
+
+        # 强制重登前清空旧令牌，避免带着失效凭证重试 / 复用
+        if force:
+            self.access_token = None
+            self.user_id = None
+            self.session.headers.pop('Authorization', None)
+            self.session.headers.pop('new-api-user', None)
 
         try:
             from turnstile_solver import login_and_get_token
@@ -101,7 +111,7 @@ class NewAPICheckin:
             # 认证失败：尝试自动登录
             if resp.status_code == 401:
                 print('[错误] 认证失败 (401)，尝试重新登录...')
-                if not self._browser_login():
+                if not self._browser_login(force=True):
                     print('  [登录] 尝试登录不成功')
                     return None
                 print('  [登录] 重试获取用户信息...')
@@ -170,26 +180,17 @@ class NewAPICheckin:
             # 认证失败：自动登录后重签
             if resp.status_code == 401:
                 result['message'] = '认证失败: 访问令牌已过期'
-                if not self._browser_login():
+                print('  [登录] 访问令牌已失效，强制重新登录...')
+                if not self._browser_login(force=True):
                     result['message'] = '尝试登录不成功'
                     return result
                 print('  [登录] 重试签到...')
                 resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        if data.get('success'):
-                            result['success'] = True
-                            result['message'] = data.get('message', '签到成功')
-                            checkin_data = data.get('data', {})
-                            if isinstance(checkin_data, dict):
-                                result['checkin_date'] = checkin_data.get('checkin_date')
-                                result['quota_awarded'] = checkin_data.get('quota_awarded')
-                            return result
-                    except Exception:
-                        pass
-                result['message'] = '重新登录后签到失败'
-                return result
+                # 重登后依然 401 才判定认证失败；其余响应交给下方统一解析，
+                # 以便正常处理「已签到 / Turnstile / PoW」等业务状态
+                if resp.status_code == 401:
+                    result['message'] = '重新登录后依然认证失败'
+                    return result
 
             try:
                 data = resp.json()
