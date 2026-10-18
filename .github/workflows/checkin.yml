@@ -1,16 +1,21 @@
 name: NewAPI 自动签到
 
 on:
-  # 定时执行：每天 UTC 00:00 (北京时间 08:00)
+  # 每天 UTC 00:00 = 北京时间 08:00
   schedule:
     - cron: '0 0 * * *'
   # 手动触发
   workflow_dispatch:
 
+# 避免手动触发与定时任务同时签到
+concurrency:
+  group: newapi-checkin
+  cancel-in-progress: false
+
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: 检出代码
@@ -24,7 +29,8 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 安装 Playwright 浏览器
+      # 系统 Chrome 不可用时作为兜底浏览器
+      - name: 安装备用 Chromium
         run: playwright install chromium --with-deps
 
       - name: 确认 Chrome 与 xvfb

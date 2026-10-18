@@ -24,6 +24,16 @@ from typing import Optional
 DEFAULT_BASE_URL = 'https://sunapi.5201201314.top'
 
 
+def _get_system_proxy() -> Optional[str]:
+    """读取系统代理，保证浏览器与 requests 走同一出口（Windows 会读注册表）"""
+    try:
+        import urllib.request
+        proxies = urllib.request.getproxies()
+        return proxies.get('https') or proxies.get('http')
+    except Exception:
+        return None
+
+
 class NewAPICheckin:
     """NewAPI 签到类（仅账号密码认证）"""
 
@@ -34,6 +44,9 @@ class NewAPICheckin:
         self.access_token = None          # 登录成功后为 'Bearer <JWT>'
         self.user_id = None               # 登录成功后自动补齐
         self.session = requests.Session()
+        proxy = _get_system_proxy()
+        if proxy:
+            self.session.proxies.update({'http': proxy, 'https': proxy})
         self.session.headers.update({
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -182,7 +195,7 @@ class NewAPICheckin:
                 result['message'] = '认证失败: 访问令牌已过期'
                 print('  [登录] 访问令牌已失效，强制重新登录...')
                 if not self._browser_login(force=True):
-                    result['message'] = '尝试登录不成功'
+                    result['message'] = '认证失败: 访问令牌已过期，且自动登录未成功'
                     return result
                 print('  [登录] 重试签到...')
                 resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
@@ -251,7 +264,7 @@ class NewAPICheckin:
             if counter > 0xffffffff:
                 raise RuntimeError('PoW 超过最大尝试次数')
 
-    def _checkin_with_pow(self, result: dict) -> dict:
+    def _checkin_with_pow(self, result: dict, _depth: int = 0) -> dict:
         """PoW 工作量证明签到（new-api 新版防滥用机制，pow_mode=replace 时替代 Turnstile）"""
         try:
             r = self.session.get(f'{self.base_url}/api/user/pow/challenge',
@@ -280,13 +293,17 @@ class NewAPICheckin:
                 if isinstance(cd, dict):
                     result['checkin_date'] = cd.get('checkin_date')
                     result['quota_awarded'] = cd.get('quota_awarded')
+            elif 'turnstile' in message.lower() and _depth < 1:
+                # 站点同时启用 PoW 与 Turnstile：解完 PoW 后转人机验证再签一次
+                print('[Turnstile] PoW 后仍需人机验证，转 Turnstile 流程...')
+                return self._turnstile_checkin(result, _depth + 1)
             else:
                 result['message'] = f'PoW 签到失败: {message}'
         except Exception as e:
             result['message'] = f'PoW 签到异常: {e}'
         return result
 
-    def _turnstile_checkin(self, result: dict) -> dict:
+    def _turnstile_checkin(self, result: dict, _depth: int = 0) -> dict:
         """
         Turnstile 人机验证回退流程
 
@@ -325,15 +342,20 @@ class NewAPICheckin:
             if isinstance(checkin_data, dict):
                 result['checkin_date'] = checkin_data.get('checkin_date')
                 result['quota_awarded'] = checkin_data.get('quota_awarded')
+        elif 'pow' in message.lower() and _depth < 1:
+            # 站点同时启用 Turnstile 与 PoW：过完人机验证后转 PoW 再签一次
+            print('[PoW] Turnstile 后仍需工作量证明，转 PoW 流程...')
+            return self._checkin_with_pow(result, _depth + 1)
         else:
             result['message'] = f'Turnstile 验证后签到失败: {message}'
 
         return result
 
     def get_checkin_history(self, month: str = None) -> Optional[dict]:
-        """获取签到历史（本月统计用）"""
+        """获取签到历史（本月统计用，月份按北京时间计算）"""
         if month is None:
-            month = datetime.now().strftime('%Y-%m')
+            from datetime import timedelta, timezone
+            month = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m')
         try:
             resp = self.session.get(
                 f'{self.base_url}/api/user/checkin',
@@ -392,7 +414,8 @@ def load_env_file():
     """加载脚本同目录下的 .env 文件到环境变量（不覆盖已有环境变量）"""
     env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
     if os.path.isfile(env_file):
-        with open(env_file, 'r', encoding='utf-8') as f:
+        # utf-8-sig 兼容 Windows 记事本保存的 BOM
+        with open(env_file, 'r', encoding='utf-8-sig') as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith('#') or '=' not in line:
@@ -400,6 +423,9 @@ def load_env_file():
                 key, _, value = line.partition('=')
                 key = key.strip()
                 value = value.strip()
+                # 去掉成对引号（.env 常见写法）
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
                 if key and value:
                     os.environ.setdefault(key, value)
 
@@ -408,15 +434,29 @@ def _mask_url(url: str) -> str:
     """脱敏 URL（日志输出用）"""
     try:
         from urllib.parse import urlparse
-        parsed = urlparse(url)
-        domain_parts = parsed.netloc.split('.')
-        if len(domain_parts) >= 2:
-            masked = f"{domain_parts[0]}.***." + '.'.join(domain_parts[-1:])
+        parsed = urlparse(url if '://' in url else 'https://' + url)
+        parts = (parsed.hostname or '').split('.')
+        if len(parts) >= 2:
+            masked = f'{parts[0]}.***.{parts[-1]}'
         else:
             masked = '***'
-        return f"{parsed.scheme}://{masked}"
+        return f'{parsed.scheme}://{masked}'
     except Exception:
         return 'https://***'
+
+
+def _mask_account(text) -> str:
+    """账号/备注脱敏（日志与 Actions 输出用）"""
+    text = str(text or '')
+    if not text:
+        return '***'
+    if '@' in text:
+        local, _, domain = text.partition('@')
+        head = local[:1] if local else '*'
+        return f'{head}***@{domain}'
+    if len(text) <= 3:
+        return '***'
+    return text[:3] + '***'
 
 
 def _format_quota(quota) -> str:
@@ -463,7 +503,7 @@ def main():
         login_password = account['login_password']
         name = account.get('name') or login_username
 
-        print(f'[{i}/{len(accounts)}] {name}')
+        print(f'[{i}/{len(accounts)}] {_mask_account(name)}')
         print(f'  站点: {_mask_url(url)}')
 
         client = NewAPICheckin(url, login_username, login_password)
@@ -471,11 +511,15 @@ def main():
         # 获取用户信息（未登录时自动浏览器登录）
         user_info = client.get_user_info()
         if user_info:
-            username = user_info.get('username', '未知')
-            masked_username = username[:3] + '***' if len(username) > 3 else '***'
-            print(f'  用户: {masked_username}')
+            print(f'  用户: {_mask_account(user_info.get("username", "未知"))}')
+        elif not client.access_token:
+            # 完全未登录，继续签到只会再启动一次浏览器重试，直接跳过
+            fail_count += 1
+            print('  结果: ❌ 登录失败（账号密码错误或站点不可达），跳过签到')
+            print()
+            continue
         else:
-            print('  用户: 获取失败（可能账号密码错误）')
+            print('  用户: 获取失败，继续尝试签到')
 
         # 执行签到
         result = client.checkin()
@@ -506,7 +550,8 @@ def main():
     print(f'签到完成: 成功 {success_count}, 失败 {fail_count}')
     print('=' * 50)
 
-    if fail_count == len(accounts) and success_count == 0:
+    # 任一账号失败都让 Actions 标红，便于及时发现问题
+    if fail_count > 0:
         sys.exit(1)
 
 

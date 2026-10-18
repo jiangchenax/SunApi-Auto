@@ -18,6 +18,7 @@ Cloudflare Turnstile 交互式验证求解器
 - login_and_get_token(base_url, username, password): 浏览器内账号密码登录（自动解 Turnstile），
   返回新版 NewAPI 登录响应的 data（含 Bearer access_token），解决系统访问令牌无法生成的问题
 """
+import atexit
 import http.server
 import json
 import os
@@ -42,6 +43,14 @@ CHROME_CANDIDATES = [
 LOCAL_HTML = ('<html><head><title>ts</title></head>'
               '<body style="margin:0"><div id="ts" style="padding:10px"></div></body></html>')
 
+# CF 验证中的页面标题（中英文都要认，否则中文界面会被误判为已通过）
+CF_CHALLENGE_TITLES = ('Just a moment', 'Attention Required', '请稍候', '正在验证',
+                       'Verifying', 'Checking your browser')
+
+# 本次运行产生的临时目录/文件，进程退出时统一清理
+_TEMP_PATHS = []
+_cleanup_registered = False
+
 RENDER_JS = '''async (sitekey) => {
     if (!document.getElementById('ts')) {
         const holder = document.createElement('div');
@@ -59,9 +68,13 @@ RENDER_JS = '''async (sitekey) => {
         await new Promise(r => setTimeout(r, 500));
     }
     if (!window.turnstile) throw new Error('turnstile api 初始化失败');
+    const holder = document.getElementById('ts');
+    // 清理上一次渲染的组件，否则重复求解时点击坐标会指向已失效的旧组件
+    try { if (window.__wid != null) turnstile.remove(window.__wid); } catch (e) {}
+    holder.innerHTML = '';
     window.__t = null; window.__e = null; window.__inter = false;
     window.__sitekey = sitekey;
-    window.__wid = turnstile.render(document.getElementById('ts'), {
+    window.__wid = turnstile.render(holder, {
         sitekey: sitekey,
         callback: t => window.__t = t,
         'error-callback': c => window.__e = String(c),
@@ -179,6 +192,27 @@ def _free_port():
     return port
 
 
+def _register_cleanup(*paths):
+    """登记临时文件/目录，进程退出时自动清理"""
+    global _cleanup_registered
+    _TEMP_PATHS.extend(p for p in paths if p)
+    if not _cleanup_registered:
+        atexit.register(_cleanup_temp)
+        _cleanup_registered = True
+
+
+def _cleanup_temp():
+    import shutil
+    for path in _TEMP_PATHS:
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+
 class _LocalHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -198,6 +232,7 @@ def _launch_chrome(proxy=None, url=None):
     dbg_port = _free_port()
     udd = tempfile.mkdtemp(prefix='ts_solver_')
     chrome_log = tempfile.NamedTemporaryFile(prefix='chrome_', suffix='.log', delete=False)
+    _register_cleanup(udd, chrome_log.name)
     args = [
         chrome,
         f'--remote-debugging-port={dbg_port}',
@@ -215,20 +250,32 @@ def _launch_chrome(proxy=None, url=None):
 
     # 轮询等待 CDP 端口就绪（冷启动可能远超 4 秒，固定 sleep 会 ECONNREFUSED）
     import socket as _socket
-    deadline = time.time() + 40
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            chrome_log.flush()
-            with open(chrome_log.name, errors='ignore') as lf:
-                tail = lf.read()[-400:]
-            raise RuntimeError(f'Chrome 启动失败（退出码 {proc.returncode}）：{tail}')
-        try:
-            with _socket.create_connection(('127.0.0.1', dbg_port), timeout=2):
+    try:
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                chrome_log.flush()
+                with open(chrome_log.name, errors='ignore') as lf:
+                    tail = lf.read()[-400:]
+                raise RuntimeError(f'Chrome 启动失败（退出码 {proc.returncode}）：{tail}')
+            try:
+                with _socket.create_connection(('127.0.0.1', dbg_port), timeout=2):
+                    time.sleep(0.5)
+                    return proc, dbg_port
+            except OSError:
                 time.sleep(0.5)
-                return proc, dbg_port
-        except OSError:
-            time.sleep(0.5)
-    raise RuntimeError('等待 Chrome CDP 端口超时（40s）')
+        raise RuntimeError('等待 Chrome CDP 端口超时（40s）')
+    except Exception:
+        # 启动失败时回收已拉起的进程，避免残留 Chrome 僵尸进程
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        raise
 
 
 def _solve_in_page(page, sitekey, max_wait=90, verbose=True):
@@ -296,7 +343,7 @@ def _wait_cf_pass(page, base_url, timeout=60, verbose=True):
     start = time.time()
     while time.time() - start < timeout:
         title = page.title()
-        if 'Attention Required' not in title and 'Just a moment' not in title:
+        if not any(k in title for k in CF_CHALLENGE_TITLES):
             return True
         if verbose:
             print(f'[Turnstile] 等待 CF 验证通过: {title[:40]}')
