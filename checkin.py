@@ -225,9 +225,9 @@ class NewAPICheckin:
                     result['quota_awarded'] = checkin_data.get('quota_awarded')
                 return result
 
-            message = data.get('message', '签到失败')
+            message = str(data.get('message') or '签到失败')
             already_keywords = ['已签到', '已经签到', 'already', '重复签到']
-            if any(k in message for k in already_keywords):
+            if any(k in message.lower() for k in already_keywords):
                 result['success'] = True
                 result['message'] = message
             elif 'turnstile' in message.lower():
@@ -288,9 +288,9 @@ class NewAPICheckin:
                 params={'pow_challenge': ch['challenge_id'], 'pow_nonce': nonce},
                 timeout=30)
             data = resp.json()
-            message = data.get('message', '签到失败')
+            message = str(data.get('message') or '签到失败')
             already_keywords = ['已签到', '已经签到', 'already', '重复签到']
-            if data.get('success') or any(k in message for k in already_keywords):
+            if data.get('success') or any(k in message.lower() for k in already_keywords):
                 result['success'] = True
                 result['message'] = f'{message} (PoW)'
                 cd = data.get('data', {})
@@ -337,9 +337,9 @@ class NewAPICheckin:
             result['message'] = 'Turnstile 验证失败: 未能获取 token 或签到请求失败'
             return result
 
-        message = resp_data.get('message', '签到失败')
+        message = str(resp_data.get('message') or '签到失败')
         already_keywords = ['已签到', '已经签到', 'already', '重复签到']
-        if resp_data.get('success') or any(k in message for k in already_keywords):
+        if resp_data.get('success') or any(k in message.lower() for k in already_keywords):
             result['success'] = True
             result['message'] = f'{message} (Turnstile)'
             checkin_data = resp_data.get('data', {})
