@@ -190,13 +190,6 @@ class NewAPICheckin:
         """
         result = {'success': False, 'message': '', 'checkin_date': None, 'quota_awarded': None}
 
-        # 没有令牌时先在浏览器里登录（登录本身需要 Turnstile），
-        # 不再先发一个注定 401 的请求；登录后继续走下面的签到流程
-        if not self.access_token and self.login_username and self.login_password:
-            print('  [登录] 先在浏览器中登录（自动解 Turnstile）...')
-            if not self._browser_login(force=True):
-                result['message'] = '登录失败（账号密码错误或站点不可达）'
-                return result
 
         try:
             resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
@@ -546,13 +539,18 @@ def main():
 
         client = NewAPICheckin(url, login_username, login_password)
 
-        # 直接签到：无令牌时内部用一次浏览器会话完成登录 + 签到
-        result = client.checkin()
-
-        # 签到后令牌已就绪，再用 requests 取用户信息，不再启动浏览器
-        user_info = client.get_user_info() if client.access_token else None
+        # 先取用户信息：未登录时在这里完成浏览器登录（解 Turnstile）
+        user_info = client.get_user_info()
         if user_info:
             print(f'  用户: {_mask_account(user_info.get("username", "未知"))}')
+        elif not client.access_token:
+            fail_count += 1
+            print('  结果: ❌ 登录失败（账号密码错误或站点不可达），跳过签到')
+            print()
+            continue
+
+        # 执行签到
+        result = client.checkin()
 
         # 执行签到
         result = client.checkin()

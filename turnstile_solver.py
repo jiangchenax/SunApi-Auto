@@ -470,9 +470,6 @@ def _checkin_in_page(page, auth_headers, sitekey=None, max_wait=120,
                 sitekey = _fetch_sitekey(page, verbose)
             if not sitekey:
                 break
-            if ts_token is None:
-                # 服务端刚下发校验要求时立即解出的 token 会被判空，稍等再解
-                time.sleep(10)
             ts_token = _solve_in_page(page, sitekey, max_wait=max_wait, verbose=verbose)
             if not ts_token:
                 break
