@@ -1,6 +1,6 @@
 # NewAPI 自动签到
 
-专为 **https://newapi.chinahk.qzz.io** 开发的自动签到脚本。
+专为 **https://sunapi.5201201314.top** 开发的自动签到脚本。
 
 **账号密码**认证
 
