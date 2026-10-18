@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NewAPI 自动签到（专为 https://newapi.chinahk.qzz.io 开发）
+NewAPI 自动签到（专为 https://sunapi.5201201314.top 开发）
 
 - 仅支持账号密码登录（环境变量 NEWAPI_ACCOUNTS 配置），无需 Session/系统访问令牌
 - 站点强制 Turnstile 人机验证，登录和签到均由真实浏览器自动解验证
@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Optional
 
 # 本仓库唯一适配站点（NEWAPI_ACCOUNTS 中 url 缺省时使用）
-DEFAULT_BASE_URL = 'https://newapi.chinahk.qzz.io'
+DEFAULT_BASE_URL = 'https://sunapi.5201201314.top'
 
 
 class NewAPICheckin:
