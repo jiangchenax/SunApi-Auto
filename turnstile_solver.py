@@ -550,6 +550,9 @@ def login_and_checkin(base_url: str, username: str, password: str, sitekey: str 
     if user.get('id'):
         auth_headers['New-Api-User'] = str(user['id'])
 
+    # 两次 Turnstile 之间需要短暂间隔，否则第二个 token 会被判无效
+    time.sleep(8)
+
     # NewAPI 需要先收到一次签到请求才会建立 Turnstile 校验上下文，
     # 预生成的 token 会被判空，因此这里保留一次探测请求
     result = solve_and_checkin(base_url, sitekey, auth_headers, proxy,
